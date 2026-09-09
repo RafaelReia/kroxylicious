@@ -145,6 +145,48 @@ class ProxyDeploymentTest {
     }
 
     @Test
+    void shouldUseFailSafeRollingUpdateStrategy() {
+        // Given
+        ProxyDeploymentDependentResource proxyDeploymentDependentResource = new ProxyDeploymentDependentResource();
+
+        // When
+        Deployment actual = proxyDeploymentDependentResource.desired(kafkaProxy, kubernetesContext);
+
+        // Then
+        assertThat(actual.getSpec().getStrategy().getType()).isEqualTo("RollingUpdate");
+        assertThat(actual.getSpec().getStrategy().getRollingUpdate().getMaxUnavailable().getIntVal()).isZero();
+        assertThat(actual.getSpec().getStrategy().getRollingUpdate().getMaxSurge().getIntVal()).isEqualTo(1);
+    }
+
+    @Test
+    void shouldLeaveServiceAccountUnsetByDefault() {
+        // Given
+        ProxyDeploymentDependentResource proxyDeploymentDependentResource = new ProxyDeploymentDependentResource();
+
+        // When
+        Deployment actual = proxyDeploymentDependentResource.desired(kafkaProxy, kubernetesContext);
+
+        // Then
+        assertThat(actual.getSpec().getTemplate().getSpec().getServiceAccountName()).isNull();
+    }
+
+    @Test
+    void shouldUseConfiguredServiceAccount() {
+        // Given
+        ProxyDeploymentDependentResource proxyDeploymentDependentResource = new ProxyDeploymentDependentResource();
+        KafkaProxy proxyWithServiceAccount = kafkaProxy.edit().editOrNewSpec()
+                .withServiceAccountName("kroxylicious-proxy")
+                .endSpec()
+                .build();
+
+        // When
+        Deployment actual = proxyDeploymentDependentResource.desired(proxyWithServiceAccount, kubernetesContext);
+
+        // Then
+        assertThat(actual.getSpec().getTemplate().getSpec().getServiceAccountName()).isEqualTo("kroxylicious-proxy");
+    }
+
+    @Test
     void shouldConfigureReadinessProbe() {
         // Given
         ProxyDeploymentDependentResource proxyDeploymentDependentResource = new ProxyDeploymentDependentResource();
