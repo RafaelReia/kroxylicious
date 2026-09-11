@@ -25,6 +25,8 @@ import io.fabric8.kubernetes.api.model.PodTemplateSpecFluent;
 import io.fabric8.kubernetes.api.model.ResourceRequirements;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
 import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
+import io.fabric8.kubernetes.client.dsl.base.PatchContext;
+import io.fabric8.kubernetes.client.dsl.base.PatchType;
 import io.fabric8.kubernetes.client.utils.KubernetesResourceUtil;
 import io.fabric8.openshift.api.model.Route;
 import io.fabric8.openshift.api.model.RouteIngress;
@@ -59,7 +61,7 @@ import static io.kroxylicious.kubernetes.operator.ResourcesUtil.namespace;
 /**
  * Generates the Kube {@code Deployment} for the proxy
  */
-@KubernetesDependent(useSSA = BooleanWithUndefined.TRUE)
+@KubernetesDependent(useSSA = BooleanWithUndefined.TRUE, matcher = ProxyDeploymentSSAMatcher.class)
 public class ProxyDeploymentDependentResource
         extends CRUDKubernetesDependentResource<Deployment, KafkaProxy> {
 
@@ -94,6 +96,23 @@ public class ProxyDeploymentDependentResource
     }
 
     @Override
+    public Deployment update(Deployment actual,
+                             Deployment desired,
+                             KafkaProxy primary,
+                             Context<KafkaProxy> context) {
+        if (hasExplicitServiceAccount(actual) && !hasExplicitServiceAccount(desired)) {
+            // Kubernetes may retain the deprecated serviceAccount alias alongside serviceAccountName.
+            // Clear both fields so omission restores namespace-default ServiceAccount resolution.
+            Deployment patched = context.getClient().resource(actual)
+                    .inNamespace(namespace(actual))
+                    .patch(PatchContext.of(PatchType.JSON_MERGE),
+                            "{\"spec\":{\"template\":{\"spec\":{\"serviceAccountName\":null,\"serviceAccount\":null}}}}");
+            return super.update(patched, desired, primary, context);
+        }
+        return super.update(actual, desired, primary, context);
+    }
+
+    @Override
     public Deployment desired(KafkaProxy primary,
                               Context<KafkaProxy> context) {
         KafkaProxyContext kafkaProxyContext = KafkaProxyContext.proxyContext(context);
@@ -115,6 +134,13 @@ public class ProxyDeploymentDependentResource
                 .endMetadata()
                 .editOrNewSpec()
                     .withReplicas(replicas)
+                    .withNewStrategy()
+                        .withType("RollingUpdate")
+                        .withNewRollingUpdate()
+                            .withMaxUnavailable(new IntOrString(0))
+                            .withMaxSurge(new IntOrString(1))
+                        .endRollingUpdate()
+                    .endStrategy()
                     .editOrNewSelector()
                     .withMatchLabels(deploymentSelector(primary))
                     .endSelector()
@@ -184,6 +210,19 @@ public class ProxyDeploymentDependentResource
         return standardLabels(primary);
     }
 
+    @Nullable
+    private static String serviceAccountName(KafkaProxy primary) {
+        return Optional.ofNullable(primary.getSpec()).map(KafkaProxySpec::getServiceAccountName).orElse(null);
+    }
+
+    static boolean hasExplicitServiceAccount(Deployment deployment) {
+        return Optional.ofNullable(deployment.getSpec())
+                .map(spec -> spec.getTemplate())
+                .map(PodTemplateSpec::getSpec)
+                .map(podSpec -> podSpec.getServiceAccountName() != null || podSpec.getServiceAccount() != null)
+                .orElse(false);
+    }
+
     private PodTemplateSpec podTemplate(KafkaProxy primary,
                                         KafkaProxyContext kafkaProxyContext,
                                         ProxyNetworkingModel ingressModel,
@@ -219,6 +258,7 @@ public class ProxyDeploymentDependentResource
             specBuilder = specBuilder.editSecurityContext().withFsGroup(PROXY_IMAGE_GID).endSecurityContext();
         }
         return specBuilder
+                .withServiceAccountName(serviceAccountName(primary))
                     .withContainers(proxyContainer(primary, kafkaProxyContext, ingressModel, clusterResolutionResults))
                     .addNewVolume()
                         .withName(CONFIG_VOLUME)

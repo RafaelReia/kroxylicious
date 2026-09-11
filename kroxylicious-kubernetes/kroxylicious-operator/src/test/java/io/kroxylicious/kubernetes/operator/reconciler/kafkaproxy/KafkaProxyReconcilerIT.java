@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -40,12 +41,15 @@ import io.fabric8.kubernetes.api.model.ContainerPort;
 import io.fabric8.kubernetes.api.model.ContainerPortBuilder;
 import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.api.model.IntOrString;
+import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.Quantity;
 import io.fabric8.kubernetes.api.model.ResourceRequirements;
 import io.fabric8.kubernetes.api.model.ResourceRequirementsBuilder;
 import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.SecretBuilder;
 import io.fabric8.kubernetes.api.model.Service;
+import io.fabric8.kubernetes.api.model.ServiceAccount;
+import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
 import io.fabric8.kubernetes.api.model.ServicePort;
 import io.fabric8.kubernetes.api.model.ServicePortBuilder;
@@ -210,6 +214,235 @@ public class KafkaProxyReconcilerIT {
 
         // then
         assertDeploymentReplicaCount(created.proxy(), 3);
+    }
+
+    @Test
+    void shouldConfigureServiceAccountOnDeployment() {
+        // given
+        var suffix = uniqueSuffix();
+        KafkaService kafkaService = kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP);
+        ServiceAccount serviceAccount = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName("kroxylicious-proxy")
+                .endMetadata()
+                .build();
+        clusterUser.create(serviceAccount);
+        KafkaProxy proxy = kafkaProxy(PROXY_A + suffix).edit().editSpec()
+                .withServiceAccountName("kroxylicious-proxy")
+                .endSpec()
+                .build();
+
+        // when
+        var created = doCreate(suffix, kafkaService, proxy);
+
+        // then
+        AWAIT.alias("Deployment as expected").untilAsserted(() -> {
+            Deployment deployment = clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy()));
+            assertThat(deployment).isNotNull()
+                    .extracting(dep -> dep.getSpec().getTemplate().getSpec().getServiceAccountName())
+                    .isEqualTo("kroxylicious-proxy");
+        });
+        AWAIT.alias("Proxy pod as expected").untilAsserted(() -> assertThat(clusterUser.resources(Pod.class).list().getItems())
+                .filteredOn(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .singleElement()
+                .extracting(pod -> pod.getSpec().getServiceAccountName())
+                .isEqualTo("kroxylicious-proxy"));
+    }
+
+    @Test
+    void shouldRollProxyPodsWhenServiceAccountChanges() {
+        // given
+        var suffix = uniqueSuffix();
+        KafkaService kafkaService = kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP);
+        ServiceAccount serviceAccountA = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName("kroxylicious-proxy-rotation-a")
+                .endMetadata()
+                .build();
+        ServiceAccount serviceAccountB = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName("kroxylicious-proxy-rotation-b")
+                .endMetadata()
+                .build();
+        clusterUser.create(serviceAccountA);
+        clusterUser.create(serviceAccountB);
+        KafkaProxy proxy = kafkaProxy(PROXY_A + suffix).edit().editSpec()
+                .withServiceAccountName("kroxylicious-proxy-rotation-a")
+                .endSpec()
+                .build();
+        var created = doCreate(suffix, kafkaService, proxy);
+        String oldPodUid = AWAIT.until(() -> clusterUser.resources(Pod.class).list().getItems().stream()
+                .filter(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .filter(pod -> "kroxylicious-proxy-rotation-a".equals(pod.getSpec().getServiceAccountName()))
+                .findFirst()
+                .map(pod -> pod.getMetadata().getUid())
+                .orElse(null), Objects::nonNull);
+
+        // when
+        KafkaProxy updatedProxy = Objects.requireNonNull(clusterUser.get(KafkaProxy.class, name(created.proxy())))
+                .edit().editSpec()
+                .withServiceAccountName("kroxylicious-proxy-rotation-b")
+                .endSpec()
+                .build();
+        clusterUser.replace(updatedProxy);
+
+        // then
+        AWAIT.alias("Deployment uses the new ServiceAccount").untilAsserted(() -> {
+            Deployment deployment = clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy()));
+            assertThat(deployment).isNotNull()
+                    .extracting(dep -> dep.getSpec().getTemplate().getSpec().getServiceAccountName())
+                    .isEqualTo("kroxylicious-proxy-rotation-b");
+        });
+        AWAIT.alias("Deployment rollout completed")
+                .untilAsserted(() -> assertThat(clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy())))
+                        .returns(true, Readiness::isDeploymentReady));
+        AWAIT.alias("Proxy pod was replaced with the new ServiceAccount").untilAsserted(() -> assertThat(clusterUser.resources(Pod.class).list().getItems())
+                .filteredOn(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .singleElement()
+                .satisfies(pod -> {
+                    assertThat(pod.getMetadata().getUid()).isNotEqualTo(oldPodUid);
+                    assertThat(pod.getSpec().getServiceAccountName()).isEqualTo("kroxylicious-proxy-rotation-b");
+                }));
+    }
+
+    @Test
+    void shouldRestoreDefaultServiceAccountWhenConfigurationIsRemoved() {
+        // given
+        var suffix = uniqueSuffix();
+        KafkaService kafkaService = kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP);
+        String configuredServiceAccountName = "kroxylicious-proxy-removal-a";
+        ServiceAccount serviceAccount = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName(configuredServiceAccountName)
+                .endMetadata()
+                .build();
+        clusterUser.create(serviceAccount);
+        KafkaProxy proxy = kafkaProxy(PROXY_A + suffix).edit().editSpec()
+                .withServiceAccountName(configuredServiceAccountName)
+                .endSpec()
+                .build();
+        var created = doCreate(suffix, kafkaService, proxy);
+        String oldPodUid = AWAIT.until(() -> clusterUser.resources(Pod.class).list().getItems().stream()
+                .filter(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .filter(pod -> configuredServiceAccountName.equals(pod.getSpec().getServiceAccountName()))
+                .findFirst()
+                .map(pod -> pod.getMetadata().getUid())
+                .orElse(null), Objects::nonNull);
+
+        // when
+        KafkaProxy updatedProxy = Objects.requireNonNull(clusterUser.get(KafkaProxy.class, name(created.proxy())))
+                .edit().editSpec()
+                .withServiceAccountName(null)
+                .endSpec()
+                .build();
+        assertThat(updatedProxy.getSpec().getServiceAccountName()).isNull();
+        clusterUser.replace(updatedProxy);
+
+        // then
+        AWAIT.alias("KafkaProxy removes the explicit ServiceAccount")
+                .untilAsserted(() -> assertThat(Objects.requireNonNull(clusterUser.get(KafkaProxy.class, name(created.proxy())))
+                        .getSpec().getServiceAccountName()).isNull());
+        AWAIT.alias("Deployment removes the explicit ServiceAccount").untilAsserted(() -> {
+            Deployment deployment = clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy()));
+            assertThat(deployment).isNotNull()
+                    .extracting(dep -> dep.getSpec().getTemplate().getSpec().getServiceAccountName())
+                    .isNull();
+        });
+        AWAIT.alias("Deployment rollout completed")
+                .untilAsserted(() -> assertThat(clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy())))
+                        .returns(true, Readiness::isDeploymentReady));
+        AWAIT.alias("Proxy pod was replaced with the default ServiceAccount").untilAsserted(() -> assertThat(clusterUser.resources(Pod.class).list().getItems())
+                .filteredOn(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .singleElement()
+                .satisfies(pod -> {
+                    assertThat(pod.getMetadata().getUid()).isNotEqualTo(oldPodUid);
+                    assertThat(pod.getSpec().getServiceAccountName()).isEqualTo("default");
+                }));
+    }
+
+    @Test
+    void shouldRetainAndRecoverProxyPodWhenNewServiceAccountIsMissing() {
+        // Given
+        var suffix = uniqueSuffix();
+        KafkaService kafkaService = kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP);
+        ServiceAccount serviceAccountA = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName("kroxylicious-proxy-failure-a")
+                .endMetadata()
+                .build();
+        String missingServiceAccountName = "missing-" + UUID.randomUUID().toString().substring(0, 8);
+        ServiceAccount serviceAccountB = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName(missingServiceAccountName)
+                .endMetadata()
+                .build();
+        clusterUser.create(serviceAccountA);
+        KafkaProxy proxy = kafkaProxy(PROXY_A + suffix).edit().editSpec()
+                .withServiceAccountName("kroxylicious-proxy-failure-a")
+                .endSpec()
+                .build();
+        var created = doCreate(suffix, kafkaService, proxy);
+        String oldPodUid = AWAIT.until(() -> clusterUser.resources(Pod.class).list().getItems().stream()
+                .filter(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .filter(pod -> "kroxylicious-proxy-failure-a".equals(pod.getSpec().getServiceAccountName()))
+                .findFirst()
+                .map(pod -> pod.getMetadata().getUid())
+                .orElse(null), Objects::nonNull);
+        KafkaProxy updatedProxy = Objects.requireNonNull(clusterUser.get(KafkaProxy.class, name(created.proxy())))
+                .edit().editSpec()
+                .withServiceAccountName(missingServiceAccountName)
+                .endSpec()
+                .build();
+
+        // When
+        clusterUser.replace(updatedProxy);
+
+        // Then
+        AWAIT.alias("Deployment uses the missing ServiceAccount").untilAsserted(() -> {
+            Deployment deployment = clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy()));
+            assertThat(deployment).isNotNull()
+                    .extracting(dep -> dep.getSpec().getTemplate().getSpec().getServiceAccountName())
+                    .isEqualTo(missingServiceAccountName);
+        });
+        AWAIT.alias("Deployment reports failed replacement").untilAsserted(() -> {
+            Deployment deployment = clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy()));
+            assertThat(deployment).isNotNull();
+            assertThat(deployment.getStatus()).isNotNull();
+            assertThat(deployment.getStatus().getConditions()).anySatisfy(condition -> {
+                assertThat(condition.getType()).isEqualTo("ReplicaFailure");
+                assertThat(condition.getStatus()).isEqualTo("True");
+                assertThat(condition.getReason()).isEqualTo("FailedCreate");
+            });
+        });
+        AWAIT.alias("Ready old proxy pod is retained").untilAsserted(() -> assertThat(clusterUser.resources(Pod.class).list().getItems())
+                .filteredOn(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .singleElement()
+                .satisfies(pod -> {
+                    assertThat(pod.getMetadata().getUid()).isEqualTo(oldPodUid);
+                    assertThat(pod.getSpec().getServiceAccountName()).isEqualTo("kroxylicious-proxy-failure-a");
+                }));
+        // When
+        clusterUser.create(serviceAccountB);
+
+        // Then
+        AWAIT.alias("Deployment rollout recovers after the ServiceAccount is created")
+                .untilAsserted(() -> assertThat(clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy())))
+                        .returns(true, Readiness::isDeploymentReady));
+        AWAIT.alias("Proxy pod is replaced after recovery").untilAsserted(() -> assertThat(clusterUser.resources(Pod.class).list().getItems())
+                .filteredOn(pod -> pod.getMetadata().getLabels().entrySet()
+                        .containsAll(ProxyDeploymentDependentResource.podLabels(created.proxy()).entrySet()))
+                .singleElement()
+                .satisfies(pod -> {
+                    assertThat(pod.getMetadata().getUid()).isNotEqualTo(oldPodUid);
+                    assertThat(pod.getSpec().getServiceAccountName()).isEqualTo(missingServiceAccountName);
+                }));
     }
 
     @Test
