@@ -117,6 +117,54 @@ Run the following to add missing license headers e.g. when adding new source fil
 mvn org.commonjava.maven.plugins:directory-maven-plugin:highest-basedir@resolve-rootdir license:format
 ```
 
+### Using SNAPSHOT Artifacts
+
+Every push to `main` and `release/*` branches publishes SNAPSHOT artifacts to the [Central Portal snapshot repository](https://central.sonatype.com/repository/maven-snapshots/).
+This lets you test against unreleased changes without building Kroxylicious from source.
+
+> **Warning:** SNAPSHOT artifacts carry no compatibility guarantees.
+> Unreleased APIs may change or be removed between snapshots without notice.
+> Do not use SNAPSHOTs in production.
+
+To pull SNAPSHOT Kroxylicious dependencies into a Maven project, add the snapshot repository to your `pom.xml`:
+
+```xml
+<repositories>
+  <repository>
+    <id>central-snapshots</id>
+    <url>https://central.sonatype.com/repository/maven-snapshots/</url>
+    <snapshots>
+      <enabled>true</enabled>
+    </snapshots>
+  </repository>
+</repositories>
+```
+
+For Gradle (Kotlin DSL):
+
+```kotlin
+repositories {
+    maven {
+        url = uri("https://central.sonatype.com/repository/maven-snapshots/")
+        mavenContent {
+            snapshotsOnly()
+        }
+    }
+}
+```
+
+Then depend on the SNAPSHOT version of any Kroxylicious artifact, for example:
+
+```xml
+<dependency>
+  <groupId>io.kroxylicious</groupId>
+  <artifactId>kroxylicious-api</artifactId>
+  <version><!-- e.g. 0.24.0-SNAPSHOT --></version>
+</dependency>
+```
+
+The current SNAPSHOT version is the `version` field in the root `pom.xml` of this repository.
+
 ### Formatting the Code
 No one likes to argue about code formatting in pull requests, as project we take the stance that if we can't automate the formatting we are not going to argue about it either. Having said that we don't want a mishmash of conflicting styles! So we attack this from multiple angles.
 
@@ -225,6 +273,13 @@ Alternatively, to test locally made changes, push the built operator and proxy i
 minikube image load kroxylicious-kubernetes/kroxylicious-operator/target/kroxylicious-operator.img.tar.gz --alsologtostderr=true 2>&1 | tail -n1
 minikube image load kroxylicious-app/target/kroxylicious-proxy.img.tar.gz --alsologtostderr=true 2>&1 | tail -n1
 minikube image load kroxylicious-kubernetes/kroxylicious-admission/target/kroxylicious-webhook.img.tar.gz --alsologtostderr=true 2>&1 | tail -n1
+```
+
+To run the OAUTHBEARER SASL termination system test, also build and load the jose4j-augmented test-clients image:
+
+```
+mvn -pl kroxylicious-test-images -Pdist clean package
+minikube image load kroxylicious-test-images/target/oauth-test-clients.img.tar.gz --alsologtostderr=true 2>&1 | tail -n1
 ```
 
 > :warning: Some minikube container runtimes may not be able to load a gzipped tar (https://github.com/kubernetes/minikube/issues/21678), if the above commands report a failure 
@@ -407,7 +462,8 @@ example config entry:
 * `KROXYLICIOUS_OPERATOR_IMAGE_NAME`: name of the image of kroxylicious operator to be used. Default value: `operator`
 * `ARCHITECTURE`: architecture of the cluster where the test clients are deployed. Default value: `System.getProperty("os.arch")`
 * `KROXYLICIOUS_OPERATOR_VERSION`: version of kroxylicious operator to be used. Default value: `${project.version}` in pom file
-* `KROXYLICIOUS_OPERATOR_INSTALL_DIR`: directory of the operator install files. Used for operator yaml installation. Default value: `System.getProperty("user.dir") + "/target/kroxylicious-operator-dist/install/"`
+* `KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE`: path of all-in-one yaml file or directory containing the operator install files. Used for operator yaml installation. Default value: `System.getProperty("user.dir") + "/target/kroxylicious-operator/install/"`
+* `KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE`: path of all-in-one yaml file or directory containing the admission webhook install files. Used for operator yaml installation. Default value: `System.getProperty("user.dir") + "/target/kroxylicious-operator/install/"`
 * `KROXYLICIOUS_IMAGE`: image location of the kroxylicious (proxy) image. Defaults to `quay.io/kroxylicious/proxy:${project.version}`
 * `KAFKA_VERSION`: kafka version to be used. Default value: `${kafka.version}` in pom file
 * `STRIMZI_VERSION`: strimzi version to be used. Default value: `${strimzi.version}` in pom file
@@ -419,6 +475,7 @@ the container engine. Default value: `$HOME/.docker/config.json`
 * `SKIP_STRIMZI_INSTALL`: skip strimzi installation. Default value: `false`
 * `KAFKA_CLIENT`: client used to produce/consume messages. Default value: `strimzi_test_client`. Currently supported values: `strimzi_test_client`, `kaf`, `kcat`, `python_test_client`
 * `TEST_CLIENTS_IMAGE`: strimzi test client image to be used when running the tests. It is useful when running regression tests. Default value: `quay.io/strimzi-test-clients/test-clients:latest-kafka-${kafka.version}`
+* `TEST_CLIENTS_OAUTH_IMAGE`: test client image used only by the OAUTHBEARER SASL termination test. This is a build of `TEST_CLIENTS_IMAGE` with `jose4j` added to the classpath (see `kroxylicious-test-images`), needed because Kafka 4.1+ clients eagerly load `jose4j` during OAUTHBEARER login (KAFKA-20184) but the upstream image doesn't bundle it. Default value: `localhost/kroxylicious/oauth-test-clients:jose4j`
 * `USE_CLOUD_KMS`: set to `true` in case AWS/Azure Cloud is used for Record Encryption System Tests. LocalStack/Lowkey-Vault will be used by default. Default value: `false`
 * `AWS_REGION`: region of the AWS Cloud account to be used for KMS management. Default value: `us-east-2`
 * `AWS_ACCESS_KEY_ID`: key id of the aws account with admin permissions to be used for KMS management. Mandatory when `AWS_USE_CLOUD` is `true`. Default value: `test`
@@ -688,7 +745,7 @@ Each `links` entry is rendered after the title as a bracketed link, e.g. `([CVE-
 | `removed`          | Removals of features or APIs                                       |
 | `fixed`            | Bug fixes                                                          |
 | `security`         | Security fixes                                                     |
-| `dependency_update`| Runtime dependency upgrades visible to users                       |
+| `build`            | Build system changes (used by Dependabot and Renovate)             |
 | `other`            | Performance improvements or user-visible refactoring               |
 
 Simple example (no migration notes):

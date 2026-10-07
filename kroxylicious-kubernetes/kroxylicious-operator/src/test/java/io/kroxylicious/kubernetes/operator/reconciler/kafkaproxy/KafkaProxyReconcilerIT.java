@@ -40,18 +40,21 @@ import io.fabric8.kubernetes.api.model.ContainerPort;
 import io.fabric8.kubernetes.api.model.ContainerPortBuilder;
 import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.api.model.IntOrString;
+import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.Quantity;
 import io.fabric8.kubernetes.api.model.ResourceRequirements;
 import io.fabric8.kubernetes.api.model.ResourceRequirementsBuilder;
 import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.SecretBuilder;
 import io.fabric8.kubernetes.api.model.Service;
+import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
 import io.fabric8.kubernetes.api.model.ServicePort;
 import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.api.model.Volume;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
 import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
+import io.fabric8.kubernetes.api.model.apps.DeploymentCondition;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 import io.fabric8.kubernetes.client.readiness.Readiness;
 import io.fabric8.openshift.api.model.Route;
@@ -86,6 +89,7 @@ import io.kroxylicious.kubernetes.api.v1alpha1.kafkaservicespec.NodeIdRanges;
 import io.kroxylicious.kubernetes.api.v1alpha1.kafkaservicespec.NodeIdRangesBuilder;
 import io.kroxylicious.kubernetes.api.v1alpha1.virtualkafkaclusterspec.Ingresses;
 import io.kroxylicious.kubernetes.api.v1alpha1.virtualkafkaclusterspec.IngressesBuilder;
+import io.kroxylicious.kubernetes.operator.Annotations;
 import io.kroxylicious.kubernetes.operator.OpenShiftUtils;
 import io.kroxylicious.kubernetes.operator.ResourcesUtil;
 import io.kroxylicious.kubernetes.operator.SecureConfigInterpolator;
@@ -210,6 +214,101 @@ public class KafkaProxyReconcilerIT {
 
         // then
         assertDeploymentReplicaCount(created.proxy(), 3);
+    }
+
+    @Test
+    void shouldConfigureServiceAccountOnDeployment() {
+        // Given
+        var suffix = uniqueSuffix();
+        String serviceAccountName = "proxy-sa" + suffix;
+        createServiceAccount(serviceAccountName);
+
+        // When
+        var created = doCreate(suffix, kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP),
+                withServiceAccountName(kafkaProxy(PROXY_A + suffix), serviceAccountName));
+
+        // Then
+        assertDeploymentServiceAccount(created.proxy(), serviceAccountName);
+        assertProxyPodServiceAccount(created.proxy(), serviceAccountName);
+    }
+
+    @Test
+    void shouldRollProxyPodsWhenServiceAccountChanges() {
+        // Given
+        var suffix = uniqueSuffix();
+        String oldServiceAccountName = "proxy-sa-old" + suffix;
+        String newServiceAccountName = "proxy-sa-new" + suffix;
+        createServiceAccount(oldServiceAccountName);
+        createServiceAccount(newServiceAccountName);
+        var created = doCreate(suffix, kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP),
+                withServiceAccountName(kafkaProxy(PROXY_A + suffix), oldServiceAccountName));
+
+        // When
+        updateServiceAccountName(created.proxy(), newServiceAccountName);
+
+        // Then
+        assertDeploymentServiceAccount(created.proxy(), newServiceAccountName);
+        assertProxyPodServiceAccount(created.proxy(), newServiceAccountName);
+    }
+
+    @Test
+    void shouldRestoreDefaultServiceAccountWhenConfigurationIsRemoved() {
+        // Given
+        var suffix = uniqueSuffix();
+        String serviceAccountName = "proxy-sa" + suffix;
+        createServiceAccount(serviceAccountName);
+        var created = doCreate(suffix, kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP),
+                withServiceAccountName(kafkaProxy(PROXY_A + suffix), serviceAccountName));
+
+        // When
+        updateServiceAccountName(created.proxy(), null);
+
+        // Then
+        assertDeploymentServiceAccount(created.proxy(), null);
+        assertProxyPodServiceAccount(created.proxy(), "default");
+    }
+
+    @Test
+    void shouldReportReplicaFailureWithoutFallingBackToDefaultWhenServiceAccountIsMissing() {
+        // Given
+        var suffix = uniqueSuffix();
+        String serviceAccountName = "proxy-sa" + suffix;
+        createServiceAccount(serviceAccountName);
+        var created = doCreate(suffix, kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP),
+                withServiceAccountName(kafkaProxy(PROXY_A + suffix), serviceAccountName));
+
+        // When
+        updateServiceAccountName(created.proxy(), "missing-sa" + suffix);
+
+        // Then
+        AWAIT.alias("Deployment reports failed pod creation").untilAsserted(() -> {
+            var deployment = clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(created.proxy()));
+            assertThat(deployment).isNotNull();
+            assertThat(deployment.getStatus().getConditions())
+                    .anySatisfy(condition -> assertThat(condition)
+                            .returns("ReplicaFailure", DeploymentCondition::getType)
+                            .returns("True", DeploymentCondition::getStatus)
+                            .returns("FailedCreate", DeploymentCondition::getReason));
+        });
+        assertProxyPodServiceAccount(created.proxy(), serviceAccountName);
+    }
+
+    @Test
+    void shouldCompleteRolloutWhenMissingServiceAccountIsCreated() {
+        // Given
+        var suffix = uniqueSuffix();
+        String serviceAccountName = "proxy-sa" + suffix;
+        String missingServiceAccountName = "missing-sa" + suffix;
+        createServiceAccount(serviceAccountName);
+        var created = doCreate(suffix, kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP),
+                withServiceAccountName(kafkaProxy(PROXY_A + suffix), serviceAccountName));
+        updateServiceAccountName(created.proxy(), missingServiceAccountName);
+
+        // When
+        createServiceAccount(missingServiceAccountName);
+
+        // Then
+        assertProxyPodServiceAccount(created.proxy(), missingServiceAccountName);
     }
 
     @Test
@@ -707,11 +806,11 @@ public class KafkaProxyReconcilerIT {
         int proxyListenPort = ProxyDeploymentDependentResource.SHARED_SNI_PORT;
 
         AWAIT.alias("shared sni service manifested").untilAsserted(() -> {
-            String serviceName = name(proxy) + "-sni";
+            String serviceName = name(loadBalancerIngress);
             var service = clusterUser.get(Service.class, serviceName);
             assertThat(service).isNotNull()
                     .describedAs(
-                            "Expect shared SNI Service for proxy '" + name(proxy) + " to exist")
+                            "Expect shared SNI Service for ingress '" + name(loadBalancerIngress) + "' to exist")
                     .extracting(svc -> svc.getSpec().getSelector())
                     .describedAs("Service's selector should select proxy pods")
                     .isEqualTo(ProxyDeploymentDependentResource.podLabels(proxy));
@@ -781,7 +880,7 @@ public class KafkaProxyReconcilerIT {
 
         // then
         AWAIT.alias("services manifested").untilAsserted(() -> {
-            String sharedSniServiceName = name(proxy) + "-sni";
+            String sharedSniServiceName = name(loadBalancerIngress);
             String clusterIpServiceName = CLUSTER_BAR + suffix + "-" + clusterIpIngress.getMetadata().getName() + "-bootstrap";
             var services = clusterUser.resources(Service.class).list().getItems();
             assertThat(services)
@@ -825,12 +924,17 @@ public class KafkaProxyReconcilerIT {
         List.of(fooCluster, barCluster).forEach(this::updateStatusObservedGeneration);
 
         // then
-        AWAIT.alias("shared sni service manifested").untilAsserted(() -> {
-            String sharedSniServiceName = name(proxy) + "-sni";
-            var services = clusterUser.resources(Service.class).list().getItems();
-            assertThat(services)
-                    .extracting(service -> service.getMetadata().getName())
-                    .containsExactly(sharedSniServiceName);
+        AWAIT.alias("one shared sni service manifested per ingress, with disjoint bootstrap-servers annotations").untilAsserted(() -> {
+            var fooService = clusterUser.get(Service.class, name(loadBalancerIngressFoo));
+            var barService = clusterUser.get(Service.class, name(loadBalancerIngressBar));
+            assertThat(fooService).describedAs("Expect shared SNI Service for ingress '" + name(loadBalancerIngressFoo) + "' to exist").isNotNull();
+            assertThat(barService).describedAs("Expect shared SNI Service for ingress '" + name(loadBalancerIngressBar) + "' to exist").isNotNull();
+            assertThat(Annotations.readBootstrapServersFrom(fooService))
+                    .extracting(Annotations.ClusterIngressBootstrapServers::clusterName)
+                    .containsExactly(name(fooCluster));
+            assertThat(Annotations.readBootstrapServersFrom(barService))
+                    .extracting(Annotations.ClusterIngressBootstrapServers::clusterName)
+                    .containsExactly(name(barCluster));
         });
 
         AWAIT.alias("proxy config - each virtual cluster configured with correct ingress").untilAsserted(() -> {
@@ -845,6 +949,81 @@ public class KafkaProxyReconcilerIT {
                     .gateway(name(loadBalancerIngressBar))
                     .sniHostIdentifiesNode()
                     .hasBootstrapAddress("bootstrap.bar.kafka:" + ProxyDeploymentDependentResource.SHARED_SNI_PORT);
+        });
+    }
+
+    @Test
+    void loadBalancerIngressWithNoReferencingClusterProducesNoService() {
+        // given
+        var suffix = uniqueSuffix();
+        KafkaProxy proxy = clusterUser.create(kafkaProxy(PROXY_A + suffix));
+        KafkaService kafkaService = updateStatusObservedGeneration(clusterUser.create(kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP)),
+                CLUSTER_BAR_BOOTSTRAP);
+
+        String referencedIngressName = "referenced-load-balancer" + suffix;
+        String orphanIngressName = "orphan-load-balancer" + suffix;
+        KafkaProxyIngress referencedIngress = updateStatusObservedGeneration(
+                clusterUser.create(loadBalancerIngress(referencedIngressName, proxy, "bootstrap.kafka", "broker-$(nodeId).kafka")));
+        updateStatusObservedGeneration(
+                clusterUser.create(loadBalancerIngress(orphanIngressName, proxy, "orphan-bootstrap.kafka", "orphan-broker-$(nodeId).kafka")));
+
+        Secret tlsServerCert = clusterUser.create(tlsKeyAndCertSecret("downstream-tls-certificate" + suffix));
+        VirtualKafkaCluster cluster = virtualKafkaCluster(CLUSTER_BAR + suffix, proxy, kafkaService,
+                List.of(createIngressForCluster(referencedIngress, tlsServerCert)), Optional.empty());
+
+        // when
+        updateStatusObservedGeneration(clusterUser.create(cluster));
+
+        // then
+        AWAIT.alias("service manifested for the referenced ingress").untilAsserted(
+                () -> assertThat(clusterUser.get(Service.class, referencedIngressName)).isNotNull());
+
+        // reconciliation of the KafkaProxy (which owns both ingresses) has now demonstrably run, so it is
+        // safe to assert on the absence of a Service for the ingress no cluster references.
+        assertThat(clusterUser.get(Service.class, orphanIngressName))
+                .describedAs("Expect no Service to be created for ingress '" + orphanIngressName + "' since no VirtualKafkaCluster references it")
+                .isNull();
+    }
+
+    @Test
+    void deletingLoadBalancerIngressRemovesItsServiceButLeavesOthers() {
+        // given
+        var suffix = uniqueSuffix();
+        KafkaProxy proxy = clusterUser.create(kafkaProxy(PROXY_A + suffix));
+        KafkaService kafkaService = updateStatusObservedGeneration(clusterUser.create(kafkaService(CLUSTER_BAR_REF + suffix, CLUSTER_BAR_BOOTSTRAP)),
+                CLUSTER_BAR_BOOTSTRAP);
+
+        KafkaProxyIngress ingressToKeep = updateStatusObservedGeneration(
+                clusterUser.create(loadBalancerIngress("keep-load-balancer" + suffix, proxy, "keep-bootstrap.kafka", "keep-broker-$(nodeId).kafka")));
+        KafkaProxyIngress ingressToDelete = updateStatusObservedGeneration(
+                clusterUser.create(loadBalancerIngress("delete-load-balancer" + suffix, proxy, "delete-bootstrap.kafka", "delete-broker-$(nodeId).kafka")));
+
+        Secret tlsServerCertKeep = clusterUser.create(tlsKeyAndCertSecret("keep-tls-certificate" + suffix));
+        Secret tlsServerCertDelete = clusterUser.create(tlsKeyAndCertSecret("delete-tls-certificate" + suffix));
+
+        VirtualKafkaCluster clusterToKeep = clusterUser.create(virtualKafkaCluster(CLUSTER_FOO + suffix, proxy, kafkaService,
+                List.of(createIngressForCluster(ingressToKeep, tlsServerCertKeep)), Optional.empty()));
+        VirtualKafkaCluster clusterToDelete = clusterUser.create(virtualKafkaCluster(CLUSTER_BAR + suffix, proxy, kafkaService,
+                List.of(createIngressForCluster(ingressToDelete, tlsServerCertDelete)), Optional.empty()));
+
+        List.of(clusterToKeep, clusterToDelete).forEach(this::updateStatusObservedGeneration);
+
+        AWAIT.alias("both shared sni services manifested").untilAsserted(() -> {
+            assertThat(clusterUser.get(Service.class, name(ingressToKeep))).isNotNull();
+            assertThat(clusterUser.get(Service.class, name(ingressToDelete))).isNotNull();
+        });
+
+        // when
+        clusterUser.delete(ingressToDelete);
+
+        // then
+        AWAIT.alias("deleted ingress's service is removed, the other remains").untilAsserted(() -> {
+            assertThat(clusterUser.get(Service.class, name(ingressToDelete)))
+                    .describedAs("Expect Service for deleted ingress '" + name(ingressToDelete) + "' to have been removed")
+                    .isNull();
+            assertThat(clusterUser.get(Service.class, name(ingressToKeep)))
+                    .describedAs("Expect Service for ingress '" + name(ingressToKeep) + "' to still exist")
+                    .isNotNull();
         });
     }
 
@@ -1611,6 +1790,48 @@ public class KafkaProxyReconcilerIT {
                     .withConfigTemplate(Map.of("transformation", "UpperCasing", "transformationConfig", Map.of("charset", "UTF-8")))
                 .endSpec().build();
         // @formatter:on
+    }
+
+    private void createServiceAccount(String serviceAccountName) {
+        clusterUser.create(new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName(serviceAccountName)
+                .endMetadata()
+                .build());
+    }
+
+    private void updateServiceAccountName(KafkaProxy proxy, @Nullable String serviceAccountName) {
+        clusterUser.replace(withServiceAccountName(Objects.requireNonNull(clusterUser.get(KafkaProxy.class, name(proxy))), serviceAccountName));
+    }
+
+    private static KafkaProxy withServiceAccountName(KafkaProxy proxy, @Nullable String serviceAccountName) {
+        return proxy.edit().editOrNewSpec()
+                .editOrNewInfrastructure()
+                .withServiceAccountName(serviceAccountName)
+                .endInfrastructure()
+                .endSpec()
+                .build();
+    }
+
+    private void assertDeploymentServiceAccount(KafkaProxy proxy, @Nullable String expectedServiceAccountName) {
+        AWAIT.alias("Deployment ServiceAccount as expected").untilAsserted(() -> {
+            var deployment = clusterUser.get(Deployment.class, ProxyDeploymentDependentResource.deploymentName(proxy));
+            assertThat(deployment).isNotNull();
+            var podSpec = deployment.getSpec().getTemplate().getSpec();
+            assertThat(podSpec.getServiceAccountName()).isEqualTo(expectedServiceAccountName);
+            assertThat(podSpec.getServiceAccount()).isEqualTo(expectedServiceAccountName);
+        });
+    }
+
+    private void assertProxyPodServiceAccount(KafkaProxy proxy, String expectedServiceAccountName) {
+        // A pod's ServiceAccount is immutable, so a change can only be observed via replacement pods
+        AWAIT.alias("Proxy pods use expected ServiceAccount").untilAsserted(() -> assertThat(clusterUser.resources(Pod.class)
+                .withLabels(ProxyDeploymentDependentResource.podLabels(proxy))
+                .list().getItems())
+                .filteredOn(pod -> pod.getMetadata().getDeletionTimestamp() == null)
+                .singleElement()
+                .extracting(pod -> pod.getSpec().getServiceAccountName())
+                .isEqualTo(expectedServiceAccountName));
     }
 
     KafkaProxy kafkaProxy(String name) {

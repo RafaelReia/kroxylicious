@@ -10,6 +10,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +38,7 @@ import io.kroxylicious.proxy.internal.CorrelationIdAllocator;
 import io.kroxylicious.proxy.internal.InternalRequestFrame;
 import io.kroxylicious.proxy.internal.InternalResponseFrame;
 import io.kroxylicious.proxy.internal.KafkaProxyExceptionMapper;
+import io.kroxylicious.proxy.internal.topology.RequestSender;
 import io.kroxylicious.proxy.router.Router;
 import io.kroxylicious.proxy.router.RouterResponse;
 import io.kroxylicious.proxy.service.HostPort;
@@ -93,7 +95,11 @@ public class RoutingHandler extends ChannelDuplexHandler {
     private final RouteDispatcher dispatcher;
     private final String virtualClusterName;
     private final String sessionId;
-    private final Subject subject;
+
+    // supplier, not a snapshot, since identity can resolve or change after handler construction (mTLS, post-SASL, reauthentication)
+    // Subject is deprecated for removal, but we depend on it until its replacement lands
+    @SuppressWarnings("removal")
+    private final Supplier<Subject> subjectSupplier;
     @Nullable
     private final Integer nodeId;
 
@@ -112,11 +118,12 @@ public class RoutingHandler extends ChannelDuplexHandler {
     private ResponseSequencer responseSequencer;
 
     // all parameters are genuinely needed: dispatch, identity, request source, router state
-    @SuppressWarnings("java:S107")
+    // Subject is deprecated for removal, but we depend on it until its replacement lands
+    @SuppressWarnings({ "java:S107", "removal" })
     private RoutingHandler(RouteDispatcher dispatcher,
                            String virtualClusterName,
                            String sessionId,
-                           Subject subject,
+                           Supplier<Subject> subjectSupplier,
                            @Nullable Integer nodeId,
                            RequestSource requestSource,
                            @Nullable Router router,
@@ -124,7 +131,7 @@ public class RoutingHandler extends ChannelDuplexHandler {
         this.dispatcher = dispatcher;
         this.virtualClusterName = virtualClusterName;
         this.sessionId = sessionId;
-        this.subject = subject;
+        this.subjectSupplier = subjectSupplier;
         this.nodeId = nodeId;
         this.requestSource = requestSource;
         this.router = router;
@@ -136,30 +143,26 @@ public class RoutingHandler extends ChannelDuplexHandler {
      * Uses a {@link ResponseSequencer} for response ordering and interacts with
      * {@link ClientConnectionStateMachine} for connection lifecycle.
      *
+     * <p>Takes an already-built {@code dispatcher} (see {@link RouteDispatcher#forTopLevel})
+     * rather than building its own, because the caller must construct the dispatcher <em>before</em>
+     * creating the router - see {@link io.kroxylicious.proxy.internal.KafkaProxyInitializer} for why.
+     *
+     * @param dispatcher the dispatcher for this connection, built via {@link RouteDispatcher#forTopLevel}
      * @param router the router plugin instance for this connection
-     * @param routes all route descriptors for this virtual cluster (top-level and nested, qualified names)
      * @param staticRoutes map from API key to the single route that always handles that key,
      *        used to bypass the router for requests that don't need dynamic routing
-     * @param sharedNodeAddresses node addresses shared across routes (e.g. from a prior metadata response),
-     *        used to route node-specific requests without an additional metadata round-trip
      * @param ccsm the connection state machine; provides session ID, subject, and connection lifecycle hooks
-     * @param nodeIdMapping the virtual-to-target node ID mapping for the top-level routing level
      * @param nodeId the virtual node ID of the gateway port that accepted this connection,
      *        or {@code null} if the gateway does not identify a specific node
      * @return the top-level routing handler
      */
-    public static RoutingHandler topLevel(Router router,
-                                          Map<String, RouteDescriptor> routes,
+    public static RoutingHandler topLevel(RouteDispatcher dispatcher,
+                                          Router router,
                                           Map<ApiKeys, String> staticRoutes,
-                                          Map<Integer, HostPort> sharedNodeAddresses,
                                           ClientConnectionStateMachine ccsm,
-                                          NodeIdMapping nodeIdMapping,
                                           @Nullable Integer nodeId) {
-        String virtualClusterName = ccsm.clusterName();
-        var allocator = ccsm.internalCorrelationIdAllocator();
-        var dispatcher = new RouteDispatcher(routes, nodeIdMapping, "", PathElement.ClientOrigin.INSTANCE, allocator, sharedNodeAddresses, virtualClusterName);
-        return new RoutingHandler(dispatcher, virtualClusterName,
-                ccsm.sessionId(), ccsm.authenticatedSubject(), nodeId,
+        return new RoutingHandler(dispatcher, ccsm.clusterName(),
+                ccsm.sessionId(), ccsm::authenticatedSubject, nodeId,
                 new VirtualClusterRequestSource(ccsm),
                 router, staticRoutes);
     }
@@ -186,13 +189,14 @@ public class RoutingHandler extends ChannelDuplexHandler {
      * @param routerNodeAddresses node addresses known at this nesting level, populated from
      *        metadata responses received through this handler
      * @param sessionId the proxy session ID, used for logging and diagnostics
-     * @param subject the authenticated subject for this connection
+     * @param subjectSupplier resolves the authenticated subject, called once per dispatched request
      * @param nodeId the virtual node ID passed from the enclosing routing level,
      *        or {@code null} if not available at this nesting depth
      * @return the nested routing handler
      */
     // all parameters are genuinely needed: identity, routing config, protocol infrastructure, session, auth, network
-    @SuppressWarnings("java:S107")
+    // Subject is deprecated for removal, but we depend on it until its replacement lands
+    @SuppressWarnings({ "java:S107", "removal" })
     public static RoutingHandler nested(PathElement.Route activationPath,
                                         String nestedRouterName,
                                         String virtualClusterName,
@@ -202,12 +206,12 @@ public class RoutingHandler extends ChannelDuplexHandler {
                                         CorrelationIdAllocator correlationIdAllocator,
                                         Map<Integer, HostPort> routerNodeAddresses,
                                         String sessionId,
-                                        Subject subject,
+                                        Supplier<Subject> subjectSupplier,
                                         @Nullable Integer nodeId) {
         var dispatcher = new RouteDispatcher(nestedRoutes, nestedNodeIdMapping, nestedRouterName + "/", activationPath,
                 correlationIdAllocator, routerNodeAddresses, virtualClusterName);
         return new RoutingHandler(dispatcher, virtualClusterName,
-                sessionId, subject, nodeId,
+                sessionId, subjectSupplier, nodeId,
                 new RouterRequestSource(activationPath, routerChainFactory, nestedRouterName),
                 null, null);
     }
@@ -366,7 +370,7 @@ public class RoutingHandler extends ChannelDuplexHandler {
         if (requestSource instanceof RouterRequestSource && frame.targetVirtualNodeId() != Frame.NO_TARGET_VIRTUAL_NODE_ID) {
             effectiveNodeId = frame.targetVirtualNodeId();
         }
-        var routingContext = new RouterContextImpl(frame, dispatcher, sessionId, subject, effectiveNodeId);
+        var routingContext = new RouterContextImpl(frame, dispatcher, sessionId, subjectSupplier.get(), effectiveNodeId);
 
         if (frame instanceof InternalRequestFrame<?> oobFrame) {
             if (requestSource instanceof VirtualClusterRequestSource(ClientConnectionStateMachine ccsm)) {
@@ -763,7 +767,10 @@ public class RoutingHandler extends ChannelDuplexHandler {
         if (router == null) {
             // Only nested handlers reach this branch; top-level handlers always have a router from construction.
             var rs = (RouterRequestSource) requestSource;
-            router = rs.routerChainFactory().createRouter(rs.routerName(), virtualClusterName);
+            RequestSender sender = (route, header, request) -> dispatcher.sendToAnyNode(route, header, request, sessionId, null);
+            router = rs.routerChainFactory().createRouter(rs.routerName(), virtualClusterName, sender);
+            rs.routerChainFactory().existingTopologyCache(rs.routerName(), virtualClusterName)
+                    .ifPresent(dispatcher::activateTopologyCache);
         }
         if (resolvedStaticRoutes == null) {
             resolvedStaticRoutes = router.staticRoutes();

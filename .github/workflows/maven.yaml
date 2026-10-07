@@ -29,6 +29,7 @@ concurrency:
 jobs:
   unittest_all:
     runs-on: ubuntu-latest
+    needs: compute_pom_version
     strategy:
       matrix:
         java:
@@ -38,7 +39,7 @@ jobs:
             version: '25'
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
@@ -57,7 +58,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
       - name: Setup Java
         uses: $/.github/actions/common/setup-java
         with:
@@ -67,14 +68,18 @@ jobs:
         uses: $/.github/actions/common/setup-minikube
         with:
           githubToken: ${{ secrets.GITHUB_TOKEN }}
-      - name: 'Test for unpublished reference release (japicmp)'
-        run: |
-          REFERENCE_RELEASE=$(mvn --quiet --projects kroxylicious-api help:evaluate -Dexpression=ApiCompatability.ReferenceVersion -DforceStdout)
-          echo "REFERENCE_RELEASE_UNPUBLISHED=$(mvn --quiet dependency:get -Dartifact=io.kroxylicious:kroxylicious-parent:${REFERENCE_RELEASE}:pom 1>/dev/null && echo false || echo true)" >> $GITHUB_ENV
       - name: 'Cache Maven packages'
+        id: cache-maven
         uses: $/.github/actions/common/cache-maven-packages
         with:
           read-only: 'false'
+      - name: 'Warm Maven dependency cache'
+        # Only on a cache miss or restore-key hit; an exact hit already has everything.
+        if: steps.cache-maven.outputs.cache-hit != 'true'
+        # excludeArtifactIds=lifecycle-mapping: org.eclipse.m2e:lifecycle-mapping is an Eclipse m2e IDE
+        # hack that was never published to Maven Central (see eclipse-m2e/m2e-core#1412). go-offline tries
+        # to resolve every referenced plugin and fails on this phantom; command-line Maven never needs it.
+        run: mvn dependency:go-offline -DexcludeArtifactIds=lifecycle-mapping -Daether.dependencyCollector.impl=bf -q
       - name: 'Unit test all modules'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,7 +97,7 @@ jobs:
             --activate-profiles ci \
             ${QA_OPTS} \
             -DskipITs \
-            -Djapicmp.skip=${REFERENCE_RELEASE_UNPUBLISHED} \
+            -Djapicmp.skip=${{ needs.compute_pom_version.outputs.reference_release_unpublished }} \
             install
       - name: Cache SonarCloud packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -109,7 +114,7 @@ jobs:
         run: |
           source scripts/ci-build-functions.sh
           run_sonar "${PROXY_PROFILES}" 'Proxy Runtime' 'kroxylicious_kroxylicious' \
-            -Djapicmp.skip=${REFERENCE_RELEASE_UNPUBLISHED}
+            -Djapicmp.skip=${{ needs.compute_pom_version.outputs.reference_release_unpublished }}
       - name: Slack Notification on Failure
         if: failure() && env.SLACK_WEBHOOK_SET == 'true' && github.event_name == 'push'
         uses: $/.github/actions/common/slack-notification
@@ -125,9 +130,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      reference_release_unpublished: ${{ steps.japicmp.outputs.reference_release_unpublished }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
       - name: 'Check out repository'
@@ -139,6 +145,16 @@ jobs:
       - name: 'Determine project version'
         id: version
         run: echo "version=$(mvn --quiet help:evaluate -Dexpression=project.version -DforceStdout)" >> "$GITHUB_OUTPUT"
+      - name: 'Test for unpublished reference release (japicmp)'
+        id: japicmp
+        run: |
+          REFERENCE_RELEASE=$(mvn --quiet --projects kroxylicious-api help:evaluate \
+            -Dexpression=ApiCompatability.ReferenceVersion -DforceStdout)
+          mvn --quiet dependency:get \
+            -Dartifact=io.kroxylicious:kroxylicious-parent:${REFERENCE_RELEASE}:pom \
+            1>/dev/null \
+            && echo "reference_release_unpublished=false" >> "$GITHUB_OUTPUT" \
+            || echo "reference_release_unpublished=true" >> "$GITHUB_OUTPUT"
 
   build_container_images:
     needs: compute_pom_version
@@ -156,7 +172,7 @@ jobs:
     if: failure() && github.event_name == 'push'
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
       - name: 'Test for Slack secret'

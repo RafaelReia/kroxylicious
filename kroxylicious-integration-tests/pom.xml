@@ -13,7 +13,7 @@
     <parent>
         <artifactId>kroxylicious-parent</artifactId>
         <groupId>io.kroxylicious</groupId>
-        <version>0.24.0-SNAPSHOT</version>
+        <version>0.25.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>kroxylicious-integration-tests</artifactId>
@@ -32,6 +32,11 @@
         <dependency>
             <groupId>io.kroxylicious</groupId>
             <artifactId>kroxylicious-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.kroxylicious</groupId>
+            <artifactId>kroxylicious-identity-api</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

@@ -48,7 +48,7 @@ jobs:
           - 5000:5000
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
@@ -82,12 +82,12 @@ jobs:
           ref: main
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
         with:
           driver-opts: network=host
 
       - name: Build Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: kroxylicious.github.io
           push: true
@@ -138,7 +138,7 @@ jobs:
     needs: build
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
@@ -149,7 +149,7 @@ jobs:
           echo "SLACK_WEBHOOK_SET=$(test ${KROXYLICIOUS_SLACK_WEBHOOK} && echo true)" >> $GITHUB_ENV
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
       - name: Slack Notification on Failure
         if: failure() && env.SLACK_WEBHOOK_SET == 'true' && github.event_name == 'push'
         uses: $/.github/actions/common/slack-notification

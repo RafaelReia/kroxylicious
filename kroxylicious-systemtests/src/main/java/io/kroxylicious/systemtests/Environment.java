@@ -8,11 +8,16 @@ package io.kroxylicious.systemtests;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Properties;
 
 import io.skodjob.kubetest4j.enums.InstallType;
 import io.skodjob.kubetest4j.environment.TestEnvironmentVariables;
+
+import io.kroxylicious.systemtests.resources.operator.AllInOneYamlManifestProvider;
+import io.kroxylicious.systemtests.resources.operator.DirectoryManifestProvider;
+import io.kroxylicious.systemtests.resources.operator.ManifestProvider;
 
 /**
  * The type Environment.
@@ -53,6 +58,7 @@ public class Environment {
     private static final String AWS_REGION_ENV = "AWS_REGION";
     private static final String KROXYLICIOUS_OPERATOR_BUNDLE_IMAGE_ENV = "KROXYLICIOUS_OPERATOR_BUNDLE_IMAGE";
     private static final String TEST_CLIENTS_IMAGE_ENV = "TEST_CLIENTS_IMAGE";
+    private static final String TEST_CLIENTS_OAUTH_IMAGE_ENV = "TEST_CLIENTS_OAUTH_IMAGE";
     private static final String OLM_OPERATOR_CHANNEL_ENV = "OLM_OPERATOR_CHANNEL";
     private static final String CATALOG_SOURCE_NAME_ENV = "CATALOG_SOURCE_NAME";
     private static final String CATALOG_NAMESPACE_ENV = "CATALOG_NAMESPACE";
@@ -60,8 +66,8 @@ public class Environment {
     private static final String SYNC_RESOURCES_DELETION_ENV = "SYNC_RESOURCES_DELETION";
     private static final String TEST_CLIENTS_PULL_SECRET_ENV = "TEST_CLIENTS_PULL_SECRET";
     private static final String ARCHITECTURE_ENV = "ARCHITECTURE";
-    private static final String KROXYLICIOUS_OPERATOR_INSTALL_DIR_ENV = "KROXYLICIOUS_OPERATOR_INSTALL_DIR";
-    private static final String KROXYLICIOUS_ADMISSION_WEBHOOK_INSTALL_DIR_ENV = "KROXYLICIOUS_ADMISSION_WEBHOOK_INSTALL_DIR";
+    private static final String KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE_ENV = "KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE";
+    private static final String KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE_ENV = "KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE";
     private static final String CURL_IMAGE_ENV = "CURL_IMAGE";
 
     /**
@@ -107,14 +113,29 @@ public class Environment {
     private static final String AWS_KROXYLICIOUS_SECRET_ACCESS_KEY_DEFAULT = AWS_SECRET_ACCESS_KEY_DEFAULT;
     public static final String AWS_REGION_DEFAULT = "us-east-2";
     private static final String TEST_CLIENTS_IMAGE_DEFAULT = "quay.io/strimzi-test-clients/test-clients:0.14.0-kafka-" + KAFKA_VERSION_DEFAULT;
+    /**
+     * A build of {@link #TEST_CLIENTS_IMAGE_DEFAULT} with jose4j added to the classpath, built by the
+     * kroxylicious-test-images module. Needed because Kafka 4.1+ eagerly loads jose4j during OAUTHBEARER
+     * SASL client login but Kafka incorrectly omits jose4j as a runtime dependency of kafka-clients (KAFKA-20184),
+     * and the upstream Strimzi test-clients image does not bundle it.
+     * <p>
+     * Deliberately a static tag containing neither "latest" nor "snapshot" (case-insensitive):
+     * {@link io.kroxylicious.systemtests.templates.ContainerTemplates#baseImageBuilder} forces
+     * {@code imagePullPolicy=Always} the first time it sees either substring in an image reference -
+     * note {@code ${project.version}} (e.g. {@code 0.24.0-SNAPSHOT}) would ALSO trigger this via the
+     * "snapshot" substring. This image only ever exists in minikube's local cache (loaded via
+     * {@code minikube image load}) and isn't served by any real registry, so an Always pull fails
+     * outright. It's rebuilt fresh right before every use, so the tag doesn't need to track versions.
+     */
+    private static final String TEST_CLIENTS_OAUTH_IMAGE_DEFAULT = "localhost/kroxylicious/oauth-test-clients:jose4j";
     private static final String OLM_OPERATOR_CHANNEL_DEFAULT = "alpha";
     private static final String CATALOG_SOURCE_NAME_DEFAULT = "kroxylicious-source";
     private static final String KROXYLICIOUS_OLM_DEPLOYMENT_NAME_DEFAULT = "kroxylicious-operator";
     private static final String CATALOG_NAMESPACE_DEFAULT = "openshift-marketplace";
     private static final boolean SYNC_RESOURCES_DELETION_DEFAULT = false;
     private static final String ARCHITECTURE_DEFAULT = System.getProperty("os.arch");
-    private static final String KROXYLICIOUS_OPERATOR_INSTALL_DIR_DEFAULT = USER_DIR + "/target/kroxylicious-operator-dist/install/";
-    private static final String KROXYLICIOUS_ADMISSION_WEBHOOK_INSTALL_DIR_DEFAULT = USER_DIR + "/target/kroxylicious-admission-dist/install/";
+    private static final String KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE_DEFAULT = USER_DIR + "/target/kroxylicious-operator/install";
+    private static final String KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE_DEFAULT = USER_DIR + "/target/kroxylicious-admission/install";
     public static final String CURL_IMAGE_DEFAULT = Constants.DOCKER_REGISTRY_GCR_MIRROR
             + "/curlimages/curl:8.21.0@sha256:7c12af72ceb38b7432ab85e1a265cff6ae58e06f95539d539b654f2cfa64bb13";
 
@@ -131,6 +152,17 @@ public class Environment {
      */
     public static final boolean SKIP_TEARDOWN = ENVIRONMENT_VARIABLES.getOrDefault(SKIP_TEARDOWN_ENV, Boolean::parseBoolean, SKIP_TEARDOWN_DEFAULT);
     public static final String KROXYLICIOUS_OPERATOR_IMAGE_DEFAULT = KROXYLICIOUS_OPERATOR_IMAGE_REPO_DEFAULT.split("/")[2];
+
+    /**
+     * Source of the operator manifest. This can either be an all-in-one yaml file, or a directory containing many yaml files.
+     */
+    public static final String KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE = ENVIRONMENT_VARIABLES.getOrDefault(KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE_ENV,
+            KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE_DEFAULT);
+    /**
+     * Source of the admission manifest. This can either be an all-in-one yaml file, or a directory containing many yaml files.
+     */
+    public static final String KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE = ENVIRONMENT_VARIABLES.getOrDefault(KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE_ENV,
+            KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE_DEFAULT);
     public static final String KROXYLICIOUS_OPERATOR_ORG_DEFAULT = KROXYLICIOUS_OPERATOR_IMAGE_REPO_DEFAULT.split("/")[1];
     public static final String KROXYLICIOUS_OPERATOR_REGISTRY_DEFAULT = KROXYLICIOUS_OPERATOR_IMAGE_REPO_DEFAULT.split("/")[0];
 
@@ -167,6 +199,7 @@ public class Environment {
     public static final String KROXYLICIOUS_OPERATOR_BUNDLE_IMAGE = ENVIRONMENT_VARIABLES.getOrDefault(KROXYLICIOUS_OPERATOR_BUNDLE_IMAGE_ENV, "");
 
     public static final String TEST_CLIENTS_IMAGE = ENVIRONMENT_VARIABLES.getOrDefault(TEST_CLIENTS_IMAGE_ENV, TEST_CLIENTS_IMAGE_DEFAULT);
+    public static final String TEST_CLIENTS_OAUTH_IMAGE = ENVIRONMENT_VARIABLES.getOrDefault(TEST_CLIENTS_OAUTH_IMAGE_ENV, TEST_CLIENTS_OAUTH_IMAGE_DEFAULT);
     public static final String TEST_CLIENTS_PULL_SECRET = ENVIRONMENT_VARIABLES.getOrDefault(TEST_CLIENTS_PULL_SECRET_ENV, "");
     public static final String OLM_OPERATOR_CHANNEL = ENVIRONMENT_VARIABLES.getOrDefault(OLM_OPERATOR_CHANNEL_ENV, OLM_OPERATOR_CHANNEL_DEFAULT);
     public static final String CATALOG_SOURCE_NAME = ENVIRONMENT_VARIABLES.getOrDefault(CATALOG_SOURCE_NAME_ENV, CATALOG_SOURCE_NAME_DEFAULT);
@@ -176,10 +209,6 @@ public class Environment {
     public static final boolean SYNC_RESOURCES_DELETION = ENVIRONMENT_VARIABLES.getOrDefault(SYNC_RESOURCES_DELETION_ENV, Boolean::parseBoolean,
             SYNC_RESOURCES_DELETION_DEFAULT);
     public static final String ARCHITECTURE = ENVIRONMENT_VARIABLES.getOrDefault(ARCHITECTURE_ENV, ARCHITECTURE_DEFAULT);
-    public static final String KROXYLICIOUS_OPERATOR_INSTALL_DIR = ENVIRONMENT_VARIABLES.getOrDefault(KROXYLICIOUS_OPERATOR_INSTALL_DIR_ENV,
-            KROXYLICIOUS_OPERATOR_INSTALL_DIR_DEFAULT);
-    public static final String KROXYLICIOUS_ADMISSION_WEBHOOK_INSTALL_DIR = ENVIRONMENT_VARIABLES.getOrDefault(KROXYLICIOUS_ADMISSION_WEBHOOK_INSTALL_DIR_ENV,
-            KROXYLICIOUS_ADMISSION_WEBHOOK_INSTALL_DIR_DEFAULT);
     public static final String CURL_IMAGE = ENVIRONMENT_VARIABLES.getOrDefault(CURL_IMAGE_ENV, CURL_IMAGE_DEFAULT);
 
     private static String readMetadataProperty(String property) {
@@ -213,5 +242,26 @@ public class Environment {
 
     private static String determineStrimziVersion() {
         return readMetadataProperty("strimzi.version");
+    }
+
+    public static ManifestProvider createOperatorManifestProvider() {
+        return getManifestProvider(Path.of(KROXYLICIOUS_OPERATOR_MANIFEST_SOURCE));
+    }
+
+    public static ManifestProvider createAdmissionManifestProvider() {
+        return getManifestProvider(Path.of(KROXYLICIOUS_ADMISSION_MANIFEST_SOURCE));
+    }
+
+    private static ManifestProvider getManifestProvider(Path source) {
+        var file = source.toFile();
+        if (file.exists() && file.isFile() && file.getName().endsWith(".yaml")) {
+            return new AllInOneYamlManifestProvider(source);
+        }
+        else if (file.exists() && file.isDirectory()) {
+            return new DirectoryManifestProvider(source);
+        }
+        else {
+            throw new IllegalStateException("Unexpected manifest source file %s. The source may not exist or be of an unsuitable type".formatted(file));
+        }
     }
 }

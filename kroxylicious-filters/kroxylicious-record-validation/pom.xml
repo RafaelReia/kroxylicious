@@ -14,7 +14,7 @@
     <parent>
         <groupId>io.kroxylicious</groupId>
         <artifactId>kroxylicious-filter-parent</artifactId>
-        <version>0.24.0-SNAPSHOT</version>
+        <version>0.25.0-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -59,6 +59,10 @@
         <dependency>
             <groupId>io.apicurio</groupId>
             <artifactId>apicurio-registry-schema-validation-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.apicurio</groupId>
+            <artifactId>apicurio-registry-java-sdk-adapter-jdk</artifactId>
         </dependency>
         <dependency>
             <groupId>io.apicurio</groupId>
@@ -146,17 +150,6 @@
         <dependency>
             <groupId>io.apicurio</groupId>
             <artifactId>apicurio-registry-schema-resolver</artifactId>
-            <exclusions>
-                <exclusion>
-                    <groupId>io.kiota</groupId>
-                    <artifactId>kiota-http-vertx</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>io.kiota</groupId>
-            <artifactId>kiota-http-jdk</artifactId>
-            <scope>runtime</scope>
         </dependency>
     </dependencies>
 
